@@ -6,74 +6,67 @@ Personal study notes and terminal labs covering Linux process internals: kernel 
 
 # Part 1: What I Learnt Today
 
-## 1. Programs vs. Processes
-* **A program is passive code sitting on disk** (like a `.exe` or an ELF binary). It takes disk space, not RAM or CPU.
-* **A process is that code actively running in memory.**
-* **Instance is process:** Each running instance of a program is a separate process.
-* **One program can spawn multiple processes:** You can run three terminal tabs or five background workers from the exact same binary on disk.
-* **Every process gets a unique PID:** The kernel assigns each process its own numeric Process ID.
-* **PIDs get recycled:** When a process exits and its parent reaps the exit code, the PID goes back into the kernel's pool to be reused later.
+* Programs are executable code and stored disk in a file.
+* A process is a live execution.
+* 1 program can have multiple processes.
+* Each process has a different PID.
+* PID can be reused.
+* Instance is process.
+* Program: .exe
+* Kernel tracks for every process:
+  * PID & PPID
+  * UID, Group ID
+  * Virtual memory
+  * FD
 
 ---
 
-## 2. What the Kernel Tracks for Every Process
-The Linux kernel tracks each process using an internal structure called `task_struct`:
-* **PID & PPID:** Its own Process ID and its parent's Process ID.
-* **UID & GID:** User and Group IDs controlling permissions.
-* **Virtual Memory:** The private virtual address space mapped for that process.
-* **File Descriptors (FDs):** Pointers to open files, standard streams (`0` stdin, `1` stdout, `2` stderr), pipes, and network sockets.
+## CPU Handling and Memory
+
+* A completely fair scheduler or EEVDF is like a traffic police. It decides which process gets into the CPU, lands on which core, and how many milliseconds it gets to run. It prioritizes which process to run based on high priority and urgency.
+* A process never talks directly to your RAM. Instead, the kernel gives the process its own virtual address space, an illusion making the process believe it has an entire memory to itself.
+* The kernel and CPU translate those virtual addresses secretly into physical RAM locations.
+* Every single process has its own separate virtual address space.
 
 ---
 
-## 3. CPU Handling and Memory
+## Process Creation: `fork()`
 
-### The Scheduler: Traffic Police
-* Linux uses the Completely Fair Scheduler (CFS) or **EEVDF** (Earliest Eligible Virtual Deadline First, added in Linux 6.6+) as a traffic cop.
-* It decides which process gets CPU time, which core it runs on, and how many milliseconds of slice it gets before yielding so nothing starves.
+* A process doesn't come out of thin air.
+* When we run a program, the current process (Bash) clones itself into a parent (Bash) and a child (Bash).
+* The parent Bash goes into sleep and waits for the child process to finish. The child Bash wipes its Bash brain, loads the command into its memory, and our desired program runs. Then it finishes and exits, and the parent Bash wakes up ready for the next command.
 
-### Virtual Memory
-* **Processes never touch physical RAM directly.**
-* The kernel gives each process its own **virtual address space**—an illusion making the process believe it owns the entire memory space.
-* The CPU's MMU and kernel page tables translate those virtual addresses to physical RAM locations on the fly.
-* Because address spaces are completely isolated, Process A cannot read or corrupt Process B's memory.
+* **`fork`** -> Bash clones itself.
+* **`exec`** -> Child process replaces its memory with a new program. PID stays the same.
 
 ---
 
-## 4. Process Creation: `fork()`
+## `execve()`
 
-Processes don't just appear out of nowhere. When you run a command in Bash:
-1. Bash **clones itself** into a parent Bash and child Bash via `fork()`.
-2. The parent Bash goes to sleep and waits for the child.
-3. The child Bash wipes its memory, loads the command binary into its address space, and runs it via `execve()`.
-4. When the program finishes and exits, the parent Bash wakes up, reaps the exit code, and displays the next prompt.
-
-### Two Core Steps
-* **`fork()` clones the process:**
-  * In the **child**, `fork()` returns `0`.
-  * In the **parent**, `fork()` returns the **child's PID** (e.g. `3721`) so the parent knows which process to wait on.
-* **`exec()` replaces memory with the new binary:**
-  * The child process swaps its memory image with the target program.
-  * **The PID stays identical.**
+* What `execve()` does:
+  * Wipes the calling process memory and loads a new binary in its place.
+  * Does not create a new process.
+* Child returns with 0.
+* Parent returns value with 3721.
+* `exec()` only wipes out code and data, but it will keep environment variables and open file descriptors.
 
 ---
 
-## 5. `execve()`
+## PID 1
 
-### How It Works
-* Wipes the calling process's memory (code, stack, heap) and loads the new binary in place.
-* **Does not create a new process:** PID and PPID stay the exact same before and after.
-* Code and data get replaced, but **environment variables and open file descriptors stay open** (unless `O_CLOEXEC` was set).
+* PID 1 is the parent of all processes.
+* The kernel treats PID 1 differently from everything else on the system.
+* If a parent dies or crashes while its child is still running, that child becomes an orphan.
+* Linux doesn't kill the child; instead, it reparents the orphan to PID 1 (or a designated subreaper). PID 1 becomes its new legal guardian.
+* PID 1 is immune to `sudo kill -9 1`.
+* PID 1 reads orphan exit code immediately so it doesn't get stuck as a zombie.
 
-### Return Values
-* `execve()` **never returns on success** because the original calling code has literally been wiped from memory. Execution jumps straight into the new binary's entry point.
-* It only returns `-1` if it fails (bad path, no permission, etc.).
-* When the program finishes, it calls `exit(0)`. That `0` is the exit status code the sleeping parent reaps with `wait()`.
+### What is PID 1?
+* The 1st user-space process started by the kernel.
 
 ---
 
-## 6. Process Lifecycle Loop
-
-Here is the exact cycle when running a command in a shell:
+## Process Lifecycle Loop
 
 ```mermaid
 flowchart TD
@@ -92,49 +85,6 @@ flowchart TD
     ParentSleep -->|"5. Parent wakes up via wait()<br>Harvests exit code (0)"| Reaped["Process Reaped<br>PID 4001 Freed from Table"]
     Reaped -->|"Ready for next command"| ParentBash
 ```
-
----
-
-## 7. PID 1
-
-### Role of PID 1
-* The first user-space process started by the kernel at boot (`systemd` or `/sbin/init`).
-* **Parent of all processes:** The entire system process tree branches off PID 1.
-* The kernel treats PID 1 differently from every other process on the box.
-
-### Orphan Adoption & Zombie Prevention
-* If a parent process dies or crashes while its child is still running, the child becomes an **orphan**.
-* Linux does not kill the child. Instead, the kernel **reparents the orphan to PID 1** (or the nearest registered subreaper).
-* **PID 1 reaps orphans:** It runs an active wait loop to harvest orphan exit codes immediately so they don't linger as dead zombies.
-* **Immunity:** PID 1 is immune to `kill -9 1`. The kernel intentionally ignores unhandled fatal signals sent to PID 1 to protect the OS from panicking.
-
----
-
-## 8. Containers and PID 1
-
-Why running apps directly as PID 1 in Docker causes issues:
-* **Zombie accumulation:** Apps like Node, Python, or Go don't implement zombie reaping loops. If child workers crash or spawn background processes, those orphans reparent to PID 1. When they exit, they stay `<defunct>` in the process table forever.
-* **Host PID exhaustion:** Containers share the host kernel. As zombies pile up, they eat slots in `/proc/sys/kernel/pid_max`. Once full, no new processes can fork anywhere on the host.
-* **Ignored signals:** The kernel does not assign default signal handlers to PID 1. If an app doesn't explicitly trap `SIGTERM`, it ignores stop requests until Docker forces a hard `SIGKILL` after 10 seconds.
-* **Fix:** Use an init wrapper like `tini`, `dumb-init`, or Docker's `--init` flag to run as PID 1, forward signals, and harvest dead child processes.
-
----
-
-## 9. Edge Cases: Orphans vs. Zombies & `O_CLOEXEC`
-
-### Orphan vs. Zombie
-| Attribute | Orphan Process | Zombie Process (`<defunct>`, State `Z`) |
-| :--- | :--- | :--- |
-| **Is it alive?** | **Yes.** Actively running code on the CPU. | **No.** Already dead and exited. |
-| **Memory** | Has full virtual address space. | Zero memory (code, heap, stack freed). |
-| **Parent State** | Biological parent is **dead**. | Parent is **alive**, but hasn't called `wait()`. |
-| **Kernel State**| Reparented to PID 1 / subreaper. | Minimal entry in Process Table holding exit code. |
-| **Can you kill it?**| Yes, via `kill <PID>`. | **No.** Already dead (`kill -9` does nothing). |
-
-### File Descriptors & `O_CLOEXEC`
-* File descriptors stay open across `execve()` by default.
-* If a parent process opens sensitive files, sockets, or database handles and calls `execve()` without closing them, the child inherits open access to those descriptors.
-* Setting `O_CLOEXEC` on open files ensures the kernel closes them automatically the instant `execve()` runs.
 
 ---
 

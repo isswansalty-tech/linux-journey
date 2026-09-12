@@ -6,146 +6,76 @@ Personal study notes and terminal labs covering Linux process termination mechan
 
 # Part 1: What I Learnt Today
 
-## 1. Exit Status Codes & The 8-Bit Boundary
-
-* **Every terminating process leaves an exit status:** When a process completes execution or crashes, it calls `exit(N)` (or `_exit(N)`). This integer return code informs the operating system and the parent process how execution finished.
-* **Status semantics:**
-  * `0`: Success / clean execution.
-  * `1` to `255`: Failure, errors, or custom application exit codes.
-* **The 8-bit constraint:** In Linux, exit codes are strictly 8-bit unsigned integers (`0` to `255`).
-  * Only the least significant 8 bits of the integer passed to `exit(N)` are preserved by the kernel (`status & 0xFF`).
-  * If a program exits with `256`, the exit code truncates to `0` (`256 % 256 = 0`). A crashed or failing application returning `256` will falsely signal success to shell scripts, orchestrators, and CI/CD pipelines.
-  * An exit code of `257` becomes `1`, `300` becomes `44`, and `-1` wraps to `255`.
-* **The `$?` shell variable:** In Bash and POSIX shells, the special parameter `$?` stores the exit status of the most recently executed foreground command or pipeline.
-* **Signal-induced termination exit codes:** When a process is killed by an unhandled signal, shells adopt the convention of setting `$?` to `128 + signal_number`:
-  * Killed by `SIGHUP` (1) -> Exit code `129`
-  * Killed by `SIGINT` (2) -> Exit code `130`
-  * Killed by `SIGKILL` (9) -> Exit code `137`
-  * Killed by `SIGTERM` (15) -> Exit code `143`
+## Process Termination
+* Exit status values:
+  * 0: Perfect / success
+  * 1 to 255: Failure / Error
+* Whenever a process finishes running, it gives the operating system an exit code or return code `[exit(N)]`.
+* Linux stores the latest exit codes in a special temp variable `$?`.
+* The kernel wipes the process from RAM and saves that integer N in the process table.
+* Exit codes are 8-bit. That means valid exit codes only range from 0 to 255.
+* Waiting: The parent process pauses until its child finishes.
+* Reaping: Parent collects the child's exit code so the system can delete it completely.
+* Without reaping, the child stays stuck as a zombie.
+* Server runs out of PID -> system crash.
+* Zombie process cannot execute and takes no space in storage/RAM, but a minimal process table entry remains.
 
 ---
 
-## 2. Waiting, Reaping, and the Zombie Lifecycle
-
-When a process terminates, the Linux kernel does not instantly vanish its entire record from the operating system:
-1. **Memory reclamation:** The kernel immediately tears down the process's private virtual address space, frees its physical RAM pages (`VmRSS`), closes open file descriptors, and releases locks.
-2. **Process table entry retained:** The kernel preserves a minimal `task_struct` entry in the system process table. This entry holds the terminated process's PID, exit status code, and resource consumption statistics.
-3. **The waiting phase:** The parent process is expected to call `wait()` or `waitpid()` to pause or synchronize until the child state changes.
-4. **The reaping phase:** When the parent calls `wait()` or `waitpid()`, the kernel transfers the child's exit status code to the parent and frees the PID and `task_struct` from the process table. The process is now fully reaped and removed.
-
-### What is a Zombie Process?
-* **Definition:** A process that has called `exit()`, freed its code and memory, but whose parent has not yet called `wait()` to harvest its exit code.
-* **Process state:** Marked as `Z` (`EXIT_ZOMBIE`) in `ps` and `/proc/<PID>/status`, commonly annotated as `<defunct>`.
-* **Resource footprint:** Consumes 0 bytes of RAM, 0 bytes of swap, and 0 CPU cycles. However, it holds onto 1 PID and 1 kernel process table slot.
-* **Immunity to signals:** You cannot kill a zombie process. Running `kill -9 <PID>` against a zombie does nothing because the process is already dead; there is no userland context or execution thread to receive or handle a signal.
-* **Eliminating zombies:** A zombie can only be cleared if:
-  1. Its parent wakes up and calls `wait()` / `waitpid()`.
-  2. Its parent is terminated. When the parent dies, the kernel reparents the zombie child to PID 1 (or the nearest subreaper), which periodically calls `wait()` to reap defunct children.
-
----
-
-## 3. Signals: Asynchronous Process Control
-
-Signals are software interrupts delivered by the Linux kernel to a process to notify it of an asynchronous system event or command request.
-
-### Common Signal Sources
-* **Keyboard input (terminal driver):**
-  * `Ctrl + C` -> `SIGINT` (Signal 2): Requests interrupt/stop. Can be caught for clean shutdown.
-  * `Ctrl + Z` -> `SIGTSTP` (Signal 20): Interactive terminal stop request. Suspends the process into the background.
-  * `Ctrl + \` -> `SIGQUIT` (Signal 3): Requests termination with a core dump.
-* **Kernel events:**
-  * `SIGSEGV` (Signal 11): Process attempted an invalid memory access (segmentation fault).
-  * `SIGFPE` (Signal 8): Erroneous arithmetic operation (e.g. integer division by zero).
-  * `SIGPIPE` (Signal 13): Process attempted to write to a pipe or socket whose read end is closed.
-  * `SIGCHLD` (Signal 17): Sent to parent whenever a child process terminates, stops, or resumes.
-* **User / Process commands (`kill` command):**
-  * `kill <PID>`: Shorthand for `kill -15 <PID>` (`kill -TERM`). Requests orderly shutdown.
+## Signals
+* A simple notification sent to a process to trigger an action (stop, pause, exit).
+* Common sources:
+  * Keyboard:
+    * Ctrl + C -> SIGINT (stop)
+    * Ctrl + Z -> SIGTSTP (pause)
+  * Kernel:
+    * SIGSEGV (crash)
+  * Other process / user command
+* 3 ways a process can react to a signal:
+  * Doing the system default (terminates)
+  * Ignore the signal and keep running
+  * Catch: Run custom code and then exit
+* SIGKILL and SIGSTOP cannot be blocked, caught, defaulted, or ignored.
+* `kill` is the same as `kill -TERM`.
+* `kill 0` can be used to check permission without delivering a real signal:
+  * A successful result means the PID exists and signaling is permitted at that instant.
+  * Failure means the process might not exist or the user might not have permission.
 
 ---
 
-## 4. Signal Reactions & Uncatchable Signals
-
-When a signal arrives at a process, there are three possible ways it can respond:
-1. **Default action (`SIG_DFL`):** The process executes the kernel's built-in default behavior for that signal (most signals terminate the process, some dump core, others are ignored like `SIGCHLD`, and stop signals pause execution).
-2. **Ignore (`SIG_IGN`):** The process instructs the kernel to drop the signal on arrival without interrupting userland execution.
-3. **Catch (Custom signal handler):** The process registers a custom handler callback function. When the kernel delivers the signal, it saves the process execution context, runs the custom code (e.g. flushing log buffers, closing database connections, removing lockfiles), and either exits or resumes.
-
-### The Two Uncatchable Signals: `SIGKILL` (9) & `SIGSTOP` (19)
-* Neither `SIGKILL` nor `SIGSTOP` can be caught, ignored, or blocked.
-* The Linux kernel intercept checks for these signals directly inside the kernel scheduler and signal delivery path before control ever returns to user space.
-* `SIGKILL` guarantees immediate, unconditional termination. The process cannot run cleanup routines.
-* `SIGSTOP` guarantees immediate suspension without userland intervention.
+## Niceness
+* Ranges from -20 to 19, default = 0.
+* High number = low priority.
+* Low number = high priority.
+* Nice value can be viewed using the `top` command in the `NI` column.
+* Commands:
+  * To start a program with a nice value: `nice -n 5 ...`
+  * To change an already existing nice value: `renice -n 10 -p [PID]`
 
 ---
 
-## 5. Process Probing with `kill -0`
-
-The `kill` syscall and CLI utility can send Signal 0 (the null signal):
-```bash
-kill -0 <PID>
-```
-* **No signal is actually delivered:** Sending signal 0 does not terminate, interrupt, or alter the target process in any way.
-* **Validation mechanism:** The kernel performs all standard permission and existence checks:
-  * **Success (exit code `0`):** The target PID exists and the calling user has permission to send signals to it.
-  * **Failure with `ESRCH` (exit code `1`):** The PID does not exist in the process table.
-  * **Failure with `EPERM` (exit code `1`):** The PID exists, but the caller lacks permission to signal it (e.g. an unprivileged user inspecting a process owned by root).
-* **Production use:** Ideal for lockfile validation, daemon health probes, and checking background worker liveness without destructive side effects.
-
----
-
-## 6. Niceness & CPU Scheduling Priority
-
-The Linux kernel scheduler (CFS / EEVDF) determines process CPU time slices based on priority.
-
-* **The Nice scale:** Ranges from `-20` to `19`, with `0` as the default.
-  * **High nice value (e.g. `+19`):** Low priority. The process is "nice" to other workloads, yielding CPU cycles.
-  * **Low or negative nice value (e.g. `-20`):** High priority. The process aggressively requests CPU time slices.
-* **Priority mapping:** In `ps` and `top`, the scheduling priority `PR` relates directly to nice `NI`:
-  $$\text{PR} = 20 + \text{NI}$$
-  * A default nice of `0` maps to priority `20`.
-  * A nice of `19` maps to priority `39`.
-  * A nice of `-20` maps to priority `0` (or real-time scheduling).
-* **CLI manipulation:**
-  * Launching with modified niceness:
-    ```bash
-    nice -n 10 ./background_worker.sh
-    ```
-  * Adjusting a running process:
-    ```bash
-    renice -n 15 -p <PID>
-    ```
-  * **Privilege rules:** Any user can lower their process priority (increase nice value). Only `root` (or processes with `CAP_SYS_NICE`) can raise priority (decrease nice value or assign negative numbers).
+## Process States
+* State codes:
+  * R (running): Actively running
+  * S (sleeping): Normal idle state
+  * D (Disk/sleep): Waiting on storage until hardware responds
+  * Z (zombie): A dead process
+  * T (stopped): Process has been paused
+* Diagnosis:
+  * S = Healthy
+  * D = Storage / hardware issue
+  * Lots of Z = Parent has a bug
 
 ---
 
-## 7. Process States & Kernel Diagnosis
-
-The Linux kernel records process execution status using single-letter state codes in `ps`, `top`, and `/proc/<PID>/status`:
-
-| State Code | Name | Description | SRE Diagnosis |
-| :--- | :--- | :--- | :--- |
-| **`R`** | Running / Runnable | Actively executing on CPU or sitting in the CFS runqueue ready to execute. | High CPU consumption; normal under active load. |
-| **`S`** | Interruptible Sleep | Idle, waiting for an event, timer, socket I/O, or pipe input. Responds immediately to signals. | Healthy baseline state for 95%+ of system daemons. |
-| **`D`** | Uninterruptible Sleep (Disk Sleep)| Blocked in a kernel syscall waiting directly on hardware or storage I/O. Does not respond to signals. | **Warning / Incident:** Indication of slow disk, hung NFS mount, corrupted filesystem, or driver deadlock. Cannot be terminated even with `kill -9`. |
-| **`T`** | Stopped | Execution paused by a job control signal (`SIGTSTP`, `SIGSTOP`) or debugger (`ptrace`). | Paused process. Resumes when sent `SIGCONT`. |
-| **`Z`** | Zombie / Defunct | Dead process that called `exit()`. Waiting for parent to call `wait()`. | **Bug in parent process:** Parent is failing to reap children. Accumulation threatens PID exhaustion. |
+## /proc
+* `/proc` is a virtual filesystem created in RAM by the kernel.
+* Takes 0 bytes of disk space.
+* Raw data source for commands like `ps` and `top`.
 
 ---
 
-## 8. `/proc` as the Kernel's State Ledger
-
-* **/proc is a virtual filesystem in RAM:** It takes up 0 bytes of persistent disk storage. It is synthesized on demand by the kernel whenever read.
-* **Source of truth:** All process inspection utilities (`ps`, `top`, `htop`, `pidof`, `fuser`, `lsof`) parse `/proc` files under the hood.
-* **Key files for termination and state analysis:**
-  * `/proc/<PID>/status`: Human-readable summary showing `Name`, `State`, `Tgid`, `Pid`, `PPid`, `FDSize`, memory allocations, and signal masks (`SigBlk`, `SigIgn`, `SigCgt`).
-  * `/proc/<PID>/stat`: Raw single-line space-delimited metrics consumed by `ps`. Field 3 is state, field 18 is priority, field 19 is nice value.
-  * `/proc/<PID>/wchan`: Name of the specific kernel wait channel / function where a sleeping (`S`) or uninterruptible (`D`) process is currently blocked.
-
----
-
-## 9. Process Termination & State Transitions
-
-The diagram below maps how a process transitions across kernel states through signals, hardware waits, termination, and parent reaping:
+## Process Termination & State Transitions
 
 ```mermaid
 flowchart TD
@@ -169,34 +99,6 @@ flowchart TD
     StateZ -->|"Parent calls wait() / waitpid()"| FullyReaped["Process Reaped<br>PID Freed into Pool"]
     StateZ -.->|"kill -9 delivered"| ZombieImmune["Ignored: Process already dead"]
 ```
-
----
-
-## 10. Production / SRE Gotchas & Edge Cases
-
-### Gotcha 1: The Exit 256 Rollover Bug Masking Failures
-Because exit codes are truncated to 8 bits (`status & 0xFF`), calling `exit(256)` results in an exit code of `0`.
-* In bash scripts or CI/CD pipelines relying on `set -e` or `if my_command; then ...`, a failure that returns `256` will report success.
-* **Fix:** Always ensure application exit codes reside strictly between `1` and `255`.
-
-### Gotcha 2: Zombie Storms & PID Exhaustion
-Zombies consume no memory, leading engineers to ignore them. However, Linux enforces a system-wide PID cap governed by `/proc/sys/kernel/pid_max` (commonly 32,768 or 4,194,304).
-* If a parent worker (e.g. an improperly written supervisor or Python microservice) forks hundreds of children per minute and never calls `wait()`, the PID table fills entirely with `<defunct>` processes.
-* Once the PID limit is reached, all subsequent `fork()` and `clone()` calls fail with error `EAGAIN` (`Resource temporarily unavailable`).
-* **Consequence:** The server cannot spawn shells, SSH connections fail, monitoring checks die, and the system must be hard rebooted or the parent killed.
-
-### Gotcha 3: The Unkillable `D`-State Process
-When a process enters state `D` (Uninterruptible Sleep), it is blocked waiting for kernel hardware response (typically an unreachable NFS share, dead SAN, or stalled disk controller).
-* Running `kill -9 <PID>` has zero effect. The kernel will not deliver signals to a task in `TASK_UNINTERRUPTIBLE` until the underlying I/O system call completes.
-* **Diagnosis:** Check `/proc/<PID>/wchan` or check kernel logs with `dmesg -T` for I/O timeouts or blocked tasks. If storage never returns, the only resolution is unmounting the hung share forcefully (`umount -f -l`) or rebooting the server.
-
-### Gotcha 4: Graceful Shutdown Escalation Pattern
-When terminating container workloads or system services, never lead with `SIGKILL`.
-* **Standard orchestration pattern (systemd / Kubernetes):**
-  1. Send `SIGTERM` to initiate graceful shutdown (flush data, terminate active HTTP requests, finish database transactions).
-  2. Start a termination grace period timer (e.g. 30 seconds).
-  3. Poll status using `kill -0 <PID>`.
-  4. If the process remains alive after the grace period expires, escalate to `SIGKILL`.
 
 ---
 
